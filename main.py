@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from docx import Document
 from lxml import etree
 
-app = FastAPI(title="ERTH Conversion Worker", version="2.0.1")
+app = FastAPI(title="ERTH Conversion Worker", version="2.0.2")
 SECRET = os.getenv("ERTH_WORKER_SECRET", "")
 ORIGIN = os.getenv("ERTH_ALLOWED_ORIGIN", "https://erthpub.com")
 TTL = int(os.getenv("ERTH_JOB_TTL", "2700"))
@@ -134,6 +134,51 @@ def _epub_paths(raw_epub):
         return PurePosixPath(rootfile)
 
 
+
+def _sanitize_epub_links(root):
+    """Remove DOCX-origin links that EPUB readers cannot resolve.
+
+    Word files often contain stale hyperlinks to local Windows files
+    (file:///C:\\...) or broken same-document bookmarks. Pandoc preserves
+    them faithfully, but EPUBCheck correctly rejects them. ERTH keeps the
+    visible text while neutralizing only the invalid link target.
+    """
+    ids = set(root.xpath("//*[@id]/@id"))
+    cleaned = {"local_file_links": 0, "broken_fragments": 0}
+
+    for a in root.xpath("//*[local-name()='a' and @href]"):
+        href = (a.get("href") or "").strip()
+        decoded = href.replace("%5C", "\\").replace("%5c", "\\")
+        low = decoded.lower()
+
+        is_local_file = (
+            low.startswith("file:")
+            or bool(re.match(r"^[a-zA-Z]:[\\\\/]", decoded))
+            or bool(re.match(r"^/[a-zA-Z]:[\\\\/]", decoded))
+        )
+        is_broken_fragment = (
+            href.startswith("#")
+            and len(href) > 1
+            and href[1:] not in ids
+        )
+
+        if is_local_file or is_broken_fragment:
+            # Preserve the visible text/children, but turn the invalid link
+            # into a neutral inline element so no content is lost.
+            ns = ""
+            if isinstance(a.tag, str) and a.tag.startswith("{"):
+                ns = a.tag.split("}", 1)[0] + "}"
+            a.tag = ns + "span"
+            a.attrib.pop("href", None)
+            a.attrib.pop("role", None)
+            if is_local_file:
+                cleaned["local_file_links"] += 1
+            else:
+                cleaned["broken_fragments"] += 1
+
+    return cleaned
+
+
 def _postprocess_epub(raw_epub, out_epub, title):
     work = Path(raw_epub).with_suffix(".unpacked")
     shutil.rmtree(work, ignore_errors=True)
@@ -190,6 +235,7 @@ def _postprocess_epub(raw_epub, out_epub, title):
             bodies = root.xpath("//*[local-name()='body']")
             if bodies:
                 bodies[0].set("dir", "rtl")
+            _sanitize_epub_links(root)
             tree.write(str(p), encoding="UTF-8", xml_declaration=True, pretty_print=True, doctype="<!DOCTYPE html>")
         except Exception:
             continue
@@ -310,7 +356,7 @@ def health():
     return {
         "ok": True,
         "service": "ERTH Conversion Worker",
-        "version": "2.0.1",
+        "version": "2.0.2",
         "engine": {"name": "pandoc", "available": shutil.which(PANDOC) is not None, "version": _pandoc_version()},
         "epubcheck": Path(JAR).exists(),
         "features": {"footnotes": True, "rtl_postprocess": True, "docx": True}
