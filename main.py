@@ -1,47 +1,64 @@
 import io, os, re, time, uuid, zipfile, subprocess, secrets, shutil, json, base64, hmac, hashlib
-from pathlib import Path
-from html import escape
+from pathlib import Path, PurePosixPath
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from docx import Document
 from lxml import etree
 
-app=FastAPI(title="ERTH Conversion Worker",version="1.1.0")
-SECRET=os.getenv("ERTH_WORKER_SECRET","")
-ORIGIN=os.getenv("ERTH_ALLOWED_ORIGIN","https://erthpub.com")
-TTL=int(os.getenv("ERTH_JOB_TTL","2700"))
-JAR=os.getenv("EPUBCHECK_JAR","/opt/epubcheck/epubcheck.jar")
-BASE=Path("/tmp/erth-jobs"); BASE.mkdir(parents=True,exist_ok=True)
-JOBS={}
-app.add_middleware(CORSMiddleware,allow_origins=[ORIGIN],allow_credentials=False,allow_methods=["GET","POST"],allow_headers=["*"])
+app = FastAPI(title="ERTH Conversion Worker", version="2.0.0")
+SECRET = os.getenv("ERTH_WORKER_SECRET", "")
+ORIGIN = os.getenv("ERTH_ALLOWED_ORIGIN", "https://erthpub.com")
+TTL = int(os.getenv("ERTH_JOB_TTL", "2700"))
+JAR = os.getenv("EPUBCHECK_JAR", "/opt/epubcheck/epubcheck.jar")
+PANDOC = os.getenv("PANDOC_BIN", "pandoc")
+BASE = Path("/tmp/erth-jobs"); BASE.mkdir(parents=True, exist_ok=True)
+JOBS = {}
+app.add_middleware(CORSMiddleware, allow_origins=[ORIGIN], allow_credentials=False, allow_methods=["GET", "POST"], allow_headers=["*"])
 
-W_NS="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-R_NS="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-NS={"w":W_NS,"r":R_NS}
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": W_NS}
+XHTML_NS = "http://www.w3.org/1999/xhtml"
+OPF_NS = "http://www.idpf.org/2007/opf"
+DC_NS = "http://purl.org/dc/elements/1.1/"
+CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
+
 
 def b64decode(s):
-    return base64.urlsafe_b64decode(s+"="*((4-len(s)%4)%4))
+    return base64.urlsafe_b64decode(s + "=" * ((4 - len(s) % 4) % 4))
+
 
 def verify_ticket(ticket, filename, platform):
-    if not SECRET or "." not in ticket: raise HTTPException(401,"invalid_ticket")
-    encoded,sig=ticket.rsplit(".",1)
-    expected=hmac.new(SECRET.encode(),encoded.encode(),hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig,expected): raise HTTPException(401,"invalid_ticket")
-    try: claims=json.loads(b64decode(encoded))
-    except Exception: raise HTTPException(401,"invalid_ticket")
-    now=int(time.time())
-    if claims.get("exp",0)<now or claims.get("iat",now)>now+30: raise HTTPException(401,"expired_ticket")
-    if claims.get("scope")!="convert_docx": raise HTTPException(403,"invalid_scope")
-    if claims.get("filename")!=filename: raise HTTPException(403,"filename_mismatch")
-    if claims.get("platform","general")!=platform: raise HTTPException(403,"platform_mismatch")
+    if not SECRET or "." not in ticket:
+        raise HTTPException(401, "invalid_ticket")
+    encoded, sig = ticket.rsplit(".", 1)
+    expected = hmac.new(SECRET.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(401, "invalid_ticket")
+    try:
+        claims = json.loads(b64decode(encoded))
+    except Exception:
+        raise HTTPException(401, "invalid_ticket")
+    now = int(time.time())
+    if claims.get("exp", 0) < now or claims.get("iat", now) > now + 30:
+        raise HTTPException(401, "expired_ticket")
+    if claims.get("scope") != "convert_docx":
+        raise HTTPException(403, "invalid_scope")
+    if claims.get("filename") != filename:
+        raise HTTPException(403, "filename_mismatch")
+    if claims.get("platform", "general") != platform:
+        raise HTTPException(403, "platform_mismatch")
     return claims
 
+
 def cleanup():
-    now=time.time()
-    for k,j in list(JOBS.items()):
-        if now-j["created"]>TTL:
-            shutil.rmtree(j["dir"],ignore_errors=True); JOBS.pop(k,None)
+    now = time.time()
+    for k, j in list(JOBS.items()):
+        if now - j["created"] > TTL:
+            shutil.rmtree(j["dir"], ignore_errors=True)
+            JOBS.pop(k, None)
+
 
 def _zip_xml(z, name):
     try:
@@ -49,225 +66,304 @@ def _zip_xml(z, name):
     except Exception:
         return None
 
+
 def inspect_docx(data):
-    if len(data)>20*1024*1024: raise HTTPException(413,"file_too_large")
-    try: z=zipfile.ZipFile(io.BytesIO(data))
-    except Exception: raise HTTPException(415,"invalid_docx")
-    names=z.namelist()
-    if "word/document.xml" not in names: raise HTTPException(415,"invalid_docx")
-    root=_zip_xml(z,"word/document.xml")
-    if root is None: raise HTTPException(415,"invalid_docx")
-    words=len(re.findall(r"[\w\u0600-\u06ff]+"," ".join(root.xpath("//w:t/text()",namespaces=NS))))
-    refs=root.xpath("//w:footnoteReference",namespaces=NS)
-    footnote_ids=[r.get("{%s}id"%W_NS) for r in refs if r.get("{%s}id"%W_NS) not in (None,"-1","0")]
-    tables=len(root.xpath("//w:tbl",namespaces=NS))
-    unsupported_footnote_tables=0
-    if "word/footnotes.xml" in names:
-        fr=_zip_xml(z,"word/footnotes.xml")
-        if fr is not None:
-            unsupported_footnote_tables=len(fr.xpath("//w:footnote[w:tbl and number(@w:id) > 0]",namespaces=NS))
-    return {
-        "words":words,
-        "pages":max(1,(words+349)//350),
-        "tables":tables + unsupported_footnote_tables,
-        "images":sum(1 for n in names if n.startswith("word/media/") and not n.endswith("/")),
-        "footnotes":len(footnote_ids),
-        "footnote_tables":unsupported_footnote_tables,
-    }
-
-def heading_level(p):
-    style=(p.style.name or "").lower() if p.style else ""
-    m=re.search(r"(?:heading|head|title)\s*([1-6])?",style)
-    return int(m.group(1) or 1) if m else 0
-
-def _run_text_html(run_el):
-    texts=[]
-    for child in run_el:
-        local=etree.QName(child).localname
-        if local=="t":
-            texts.append(escape(child.text or "",quote=True))
-        elif local=="tab":
-            texts.append(" ")
-        elif local in ("br","cr"):
-            texts.append("<br/>")
-    text="".join(texts)
-    if not text:
-        return ""
-    rpr=run_el.find("{%s}rPr"%W_NS)
-    if rpr is not None:
-        if rpr.find("{%s}b"%W_NS) is not None:
-            text="<strong>"+text+"</strong>"
-        if rpr.find("{%s}i"%W_NS) is not None:
-            text="<em>"+text+"</em>"
-    return text
-
-def _extract_footnotes(z):
-    if "word/footnotes.xml" not in z.namelist():
-        return {}
-    root=_zip_xml(z,"word/footnotes.xml")
-    if root is None:
-        return {}
-    notes={}
-    for fn in root.xpath("//w:footnote",namespaces=NS):
-        fid=fn.get("{%s}id"%W_NS)
-        if fid in (None,"-1","0"):
-            continue
-        parts=[]
-        for p in fn.xpath("./w:p",namespaces=NS):
-            buf=[]
-            for child in p:
-                if etree.QName(child).localname=="r":
-                    # Ignore Word's automatic footnote marker inside the note.
-                    if child.find(".//{%s}footnoteRef"%W_NS) is not None:
-                        continue
-                    buf.append(_run_text_html(child))
-                elif etree.QName(child).localname=="hyperlink":
-                    for r in child.xpath("./w:r",namespaces=NS):
-                        buf.append(_run_text_html(r))
-            html="".join(buf).strip()
-            if html:
-                parts.append("<p>"+html+"</p>")
-        notes[fid]="".join(parts) if parts else "<p></p>"
-    return notes
-
-def _para_html_with_refs(p, note_map, number_map, chapter_note_ids):
-    buf=[]
-    # Use the underlying OOXML to preserve footnote references in their exact inline position.
-    for child in p._p:
-        local=etree.QName(child).localname
-        if local=="r":
-            ref=child.find(".//{%s}footnoteReference"%W_NS)
-            if ref is not None:
-                fid=ref.get("{%s}id"%W_NS)
-                if fid in note_map:
-                    if fid not in number_map:
-                        number_map[fid]=len(number_map)+1
-                    n=number_map[fid]
-                    chapter_note_ids.append(fid)
-                    buf.append(
-                        '<a epub:type="noteref" role="doc-noteref" '
-                        'id="fnref-%d" href="#fn-%d"><sup>%d</sup></a>'%(n,n,n)
-                    )
-                continue
-            buf.append(_run_text_html(child))
-        elif local=="hyperlink":
-            # Preserve visible hyperlink text without external relationship targets in MVP.
-            for r in child.xpath("./w:r",namespaces=NS):
-                buf.append(_run_text_html(r))
-    return "".join(buf).strip()
-
-def _render_footnotes(note_ids, note_map, number_map):
-    seen=set(); items=[]
-    for fid in note_ids:
-        if fid in seen or fid not in note_map:
-            continue
-        seen.add(fid)
-        n=number_map[fid]
-        items.append(
-            '<aside epub:type="footnote" role="doc-footnote" id="fn-%d" class="footnote">'
-            '<span class="footnote-number">%d.</span> %s '
-            '<a class="footnote-back" href="#fnref-%d" aria-label="العودة إلى موضع الحاشية">↩</a>'
-            '</aside>'%(n,n,note_map[fid],n)
-        )
-    if not items:
-        return ""
-    return '<section class="footnotes" epub:type="footnotes"><h2>الحواشي</h2>'+"".join(items)+"</section>"
-
-def build_epub(data,out):
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(413, "file_too_large")
     try:
-        zin=zipfile.ZipFile(io.BytesIO(data))
+        z = zipfile.ZipFile(io.BytesIO(data))
     except Exception:
-        raise HTTPException(415,"invalid_docx")
-    note_map=_extract_footnotes(zin)
-    zin.close()
+        raise HTTPException(415, "invalid_docx")
+    names = z.namelist()
+    if "word/document.xml" not in names:
+        raise HTTPException(415, "invalid_docx")
+    root = _zip_xml(z, "word/document.xml")
+    if root is None:
+        raise HTTPException(415, "invalid_docx")
+    words = len(re.findall(r"[\w\u0600-\u06ff]+", " ".join(root.xpath("//w:t/text()", namespaces=NS))))
+    refs = root.xpath("//w:footnoteReference", namespaces=NS)
+    footnote_ids = [r.get("{%s}id" % W_NS) for r in refs if r.get("{%s}id" % W_NS) not in (None, "-1", "0")]
+    tables = len(root.xpath("//w:tbl", namespaces=NS))
+    unsupported_footnote_tables = 0
+    if "word/footnotes.xml" in names:
+        fr = _zip_xml(z, "word/footnotes.xml")
+        if fr is not None:
+            unsupported_footnote_tables = len(fr.xpath("//w:footnote[w:tbl and number(@w:id) > 0]", namespaces=NS))
+    stats = {
+        "words": words,
+        "pages": max(1, (words + 349) // 350),
+        "tables": tables + unsupported_footnote_tables,
+        "images": sum(1 for n in names if n.startswith("word/media/") and not n.endswith("/")),
+        "footnotes": len(footnote_ids),
+        "footnote_tables": unsupported_footnote_tables,
+    }
+    z.close()
+    return stats
 
-    doc=Document(io.BytesIO(data)); title=(doc.core_properties.title or "").strip() or "كتاب رقمي"
-    chapters=[]; cur={"title":title,"body":[],"note_ids":[]}
-    number_map={}
-    for p in doc.paragraphs:
-        html=_para_html_with_refs(p,note_map,number_map,cur["note_ids"])
-        if not html: continue
-        level=heading_level(p)
-        if level and level<=2:
-            if cur["body"]:
-                chapters.append(cur)
-            cur={"title":p.text.strip() or "فصل","body":[],"note_ids":[]}
-        elif level:
-            cur["body"].append("<h%d>%s</h%d>"%(level,html,level))
-        else:
-            cur["body"].append("<p>"+html+"</p>")
-    if cur["body"]: chapters.append(cur)
-    if not chapters: raise HTTPException(422,"no_convertible_text")
-    if len(chapters)>120: raise HTTPException(422,detail={"status":"team_review","reason":"too_many_chapters"})
 
-    # Validate that every referenced footnote was found before producing an EPUB.
-    missing=[fid for fid in number_map if fid not in note_map]
-    if missing:
-        raise HTTPException(422,detail={"status":"team_review","reason":"missing_footnote_content","count":len(missing)})
+def _docx_title(data):
+    try:
+        doc = Document(io.BytesIO(data))
+        title = (doc.core_properties.title or "").strip()
+        if title:
+            return title
+        for p in doc.paragraphs[:20]:
+            if p.text and p.style and (p.style.name or "").lower() in ("title", "subtitle"):
+                return p.text.strip()
+    except Exception:
+        pass
+    return "كتاب رقمي"
 
-    uid="urn:uuid:"+str(uuid.uuid4()); modified=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
-    manifest=[];spine=[];nav=[];preview=[]
-    with zipfile.ZipFile(out,"w") as z:
-        zi=zipfile.ZipInfo("mimetype")
-        zi.compress_type=zipfile.ZIP_STORED
-        z.writestr(zi,"application/epub+zip")
-        z.writestr("META-INF/container.xml",'<?xml version="1.0" encoding="UTF-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="EPUB/package.opf" media-type="application/oebps-package+xml"/></rootfiles></container>')
-        z.writestr("EPUB/styles.css","html{direction:rtl}body{direction:rtl;text-align:right;font-family:serif;line-height:1.9;margin:5%;color:#202733}p{text-align:justify;text-justify:inter-word;margin:0 0 1em}h1,h2,h3,h4,h5,h6{direction:rtl;text-align:right;line-height:1.5}a[epub\\:type='noteref']{text-decoration:none}.footnotes{margin-top:2.5em;border-top:1px solid #ccc;padding-top:1em}.footnote{margin:.9em 0;line-height:1.7}.footnote-number{font-weight:700}.footnote-back{text-decoration:none;margin-inline-start:.4em}")
-        for i,c in enumerate(chapters,1):
-            fn="chapter-%03d.xhtml"%i; ident="ch%d"%i
-            footnotes_html=_render_footnotes(c["note_ids"],note_map,number_map)
-            body="<h1>"+escape(c["title"],quote=True)+"</h1>"+"".join(c["body"])+footnotes_html
-            x='<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="ar" lang="ar" dir="rtl"><head><meta charset="utf-8"/><title>'+escape(c["title"],quote=True)+'</title><link rel="stylesheet" type="text/css" href="styles.css"/></head><body>'+body+'</body></html>'
-            z.writestr("EPUB/"+fn,x)
-            manifest.append('<item id="%s" href="%s" media-type="application/xhtml+xml"/>'%(ident,fn));spine.append('<itemref idref="%s"/>'%ident)
-            nav.append('<li><a href="%s">%s</a></li>'%(fn,escape(c["title"],quote=True)));preview.append({"title":c["title"],"html":body})
-        z.writestr("EPUB/nav.xhtml",'<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="ar" lang="ar" dir="rtl"><head><meta charset="utf-8"/><title>الفهرس</title></head><body><nav epub:type="toc" id="toc"><h1>الفهرس</h1><ol>'+"".join(nav)+'</ol></nav></body></html>')
-        opf='<?xml version="1.0" encoding="UTF-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id" xml:lang="ar" dir="rtl"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="book-id">'+uid+'</dc:identifier><dc:title>'+escape(title,quote=True)+'</dc:title><dc:language>ar</dc:language><meta property="dcterms:modified">'+modified+'</meta></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="css" href="styles.css" media-type="text/css"/>'+"".join(manifest)+'</manifest><spine page-progression-direction="rtl">'+"".join(spine)+'</spine></package>'
-        z.writestr("EPUB/package.opf",opf)
-    return title,preview,{"footnotes":len(number_map)}
+
+def _pandoc_version():
+    try:
+        p = subprocess.run([PANDOC, "--version"], capture_output=True, text=True, timeout=10)
+        first = (p.stdout or p.stderr).splitlines()[0] if (p.stdout or p.stderr) else ""
+        return first.strip()
+    except Exception:
+        return "unavailable"
+
+
+def _epub_paths(raw_epub):
+    with zipfile.ZipFile(raw_epub) as z:
+        container = etree.fromstring(z.read("META-INF/container.xml"))
+        ns = {"c": CONTAINER_NS}
+        rootfile = container.xpath("string(//c:rootfile/@full-path)", namespaces=ns)
+        if not rootfile:
+            raise RuntimeError("missing_opf")
+        return PurePosixPath(rootfile)
+
+
+def _postprocess_epub(raw_epub, out_epub, title):
+    work = Path(raw_epub).with_suffix(".unpacked")
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    with zipfile.ZipFile(raw_epub) as z:
+        z.extractall(work)
+
+    opf_rel = _epub_paths(raw_epub)
+    opf_path = work / Path(str(opf_rel))
+    opf = etree.parse(str(opf_path))
+    opf_root = opf.getroot()
+    ns = {"opf": OPF_NS, "dc": DC_NS}
+
+    languages = opf.xpath("//dc:language", namespaces=ns)
+    if languages:
+        languages[0].text = "ar"
+    metadata = opf.xpath("//opf:metadata", namespaces=ns)
+    if metadata and not languages:
+        el = etree.Element("{%s}language" % DC_NS); el.text = "ar"; metadata[0].append(el)
+    titles = opf.xpath("//dc:title", namespaces=ns)
+    if titles:
+        titles[0].text = title
+    elif metadata:
+        el = etree.Element("{%s}title" % DC_NS); el.text = title; metadata[0].append(el)
+    spines = opf.xpath("//opf:spine", namespaces=ns)
+    if spines:
+        spines[0].set("page-progression-direction", "rtl")
+
+    manifest = {}
+    for item in opf.xpath("//opf:manifest/opf:item", namespaces=ns):
+        manifest[item.get("id")] = (item.get("href"), item.get("media-type"), item.get("properties", ""))
+
+    opf.write(str(opf_path), encoding="UTF-8", xml_declaration=True, pretty_print=True)
+
+    opf_dir = opf_path.parent
+    xhtml_files = []
+    css_files = []
+    for _id, (href, media_type, _props) in manifest.items():
+        if not href:
+            continue
+        p = opf_dir / Path(href)
+        if media_type == "application/xhtml+xml" and p.exists():
+            xhtml_files.append(p)
+        elif media_type == "text/css" and p.exists():
+            css_files.append(p)
+
+    for p in xhtml_files:
+        try:
+            tree = etree.parse(str(p))
+            root = tree.getroot()
+            root.set("lang", "ar")
+            root.set("{%s}lang" % XML_NS, "ar")
+            root.set("dir", "rtl")
+            bodies = root.xpath("//*[local-name()='body']")
+            if bodies:
+                bodies[0].set("dir", "rtl")
+            tree.write(str(p), encoding="UTF-8", xml_declaration=True, pretty_print=True, doctype="<!DOCTYPE html>")
+        except Exception:
+            continue
+
+    erth_css = """
+html,body{direction:rtl;text-align:right}
+body{font-family:serif;line-height:1.9;color:#202733}
+p{text-align:justify;text-justify:inter-word}
+h1,h2,h3,h4,h5,h6{direction:rtl;text-align:right;line-height:1.5}
+a[epub\\:type='noteref'],a.footnote-ref{text-decoration:none}
+.footnotes{margin-top:2.5em;border-top:1px solid #ccc;padding-top:1em}
+.footnote{line-height:1.75}
+""".strip() + "\n"
+    if css_files:
+        for p in css_files:
+            current = p.read_text(encoding="utf-8", errors="ignore")
+            p.write_text(erth_css + current, encoding="utf-8")
+    else:
+        styles = opf_dir / "styles"; styles.mkdir(exist_ok=True)
+        css = styles / "erth.css"; css.write_text(erth_css, encoding="utf-8")
+        manifest_el = opf.xpath("//opf:manifest", namespaces=ns)[0]
+        item = etree.Element("{%s}item" % OPF_NS, id="erth-css", href="styles/erth.css", **{"media-type": "text/css"})
+        manifest_el.append(item)
+        opf.write(str(opf_path), encoding="UTF-8", xml_declaration=True, pretty_print=True)
+
+    with zipfile.ZipFile(out_epub, "w") as zout:
+        mimetype = work / "mimetype"
+        zi = zipfile.ZipInfo("mimetype")
+        zi.compress_type = zipfile.ZIP_STORED
+        zout.writestr(zi, mimetype.read_bytes() if mimetype.exists() else b"application/epub+zip")
+        for p in sorted(work.rglob("*")):
+            if not p.is_file() or p == mimetype:
+                continue
+            arc = p.relative_to(work).as_posix()
+            zout.write(p, arc, compress_type=zipfile.ZIP_DEFLATED)
+    shutil.rmtree(work, ignore_errors=True)
+
+
+def _extract_preview(epub_path):
+    chapters = []
+    footnotes = 0
+    with zipfile.ZipFile(epub_path) as z:
+        opf_rel = _epub_paths(epub_path)
+        opf_root = etree.fromstring(z.read(str(opf_rel)))
+        ns = {"opf": OPF_NS}
+        manifest = {}
+        for item in opf_root.xpath("//opf:manifest/opf:item", namespaces=ns):
+            manifest[item.get("id")] = (item.get("href"), item.get("media-type"), item.get("properties", ""))
+        opf_dir = opf_rel.parent
+        for itemref in opf_root.xpath("//opf:spine/opf:itemref", namespaces=ns):
+            idref = itemref.get("idref")
+            meta = manifest.get(idref)
+            if not meta:
+                continue
+            href, media_type, props = meta
+            if media_type != "application/xhtml+xml" or "nav" in props or "title_page" in (href or ""):
+                continue
+            rel = (opf_dir / PurePosixPath(href)).as_posix()
+            if rel not in z.namelist():
+                continue
+            try:
+                root = etree.fromstring(z.read(rel))
+            except Exception:
+                continue
+            bodies = root.xpath("//*[local-name()='body']")
+            if not bodies:
+                continue
+            body = bodies[0]
+            footnotes += len(body.xpath(".//*[@epub:type='footnote']", namespaces={"epub":"http://www.idpf.org/2007/ops"}))
+            heading = body.xpath("string((.//*[local-name()='h1' or local-name()='h2'])[1])").strip()
+            title = heading or f"قسم {len(chapters)+1}"
+            html = "".join(etree.tostring(c, encoding="unicode", method="html") for c in body)
+            chapters.append({"title": title, "html": html})
+    return chapters, footnotes
+
+
+def build_epub(data, out):
+    title = _docx_title(data)
+    out = Path(out)
+    jobdir = out.parent
+    src = jobdir / "source.docx"
+    raw = jobdir / "pandoc.epub"
+    css = jobdir / "erth.css"
+    src.write_bytes(data)
+    css.write_text("html,body{direction:rtl;text-align:right} p{text-align:justify;text-justify:inter-word}", encoding="utf-8")
+
+    cmd = [
+        PANDOC, str(src), "-o", str(raw), "--to=epub3", "--toc",
+        "--metadata", f"title={title}", "--metadata", "lang=ar", "--css", str(css)
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if p.returncode != 0 or not raw.exists():
+        raise RuntimeError("pandoc_failed: " + ((p.stderr or p.stdout or "unknown")[-1500:]))
+    _postprocess_epub(raw, out, title)
+    chapters, footnotes = _extract_preview(out)
+    if not chapters:
+        raise RuntimeError("preview_extraction_failed")
+    return title, chapters, {"footnotes": footnotes, "engine": "pandoc", "engine_version": _pandoc_version()}
+
 
 def epubcheck(path):
-    p=subprocess.run(["java","-jar",JAR,str(path)],capture_output=True,text=True,timeout=90)
-    return {"status":"passed" if p.returncode==0 else "failed","passed":p.returncode==0,"tail":(p.stdout+p.stderr)[-4000:]}
+    try:
+        p = subprocess.run(["java", "-jar", JAR, str(path)], capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        return {"status": "failed", "passed": False, "tail": str(e)[-1000:]}
+    return {"status": "passed" if p.returncode == 0 else "failed", "passed": p.returncode == 0, "tail": (p.stdout + p.stderr)[-6000:]}
 
-def get_job(jobid,token):
-    cleanup();j=JOBS.get(jobid)
-    if not j or not hmac.compare_digest(j["token"],token):raise HTTPException(404,"missing_or_expired")
+
+def get_job(jobid, token):
+    cleanup(); j = JOBS.get(jobid)
+    if not j or not hmac.compare_digest(j["token"], token):
+        raise HTTPException(404, "missing_or_expired")
     return j
+
 
 @app.get("/health")
 def health():
-    return {"ok":True,"service":"ERTH Conversion Worker","version":"1.1.0","epubcheck":Path(JAR).exists(),"features":{"footnotes":True}}
+    return {
+        "ok": True,
+        "service": "ERTH Conversion Worker",
+        "version": "2.0.0",
+        "engine": {"name": "pandoc", "available": shutil.which(PANDOC) is not None, "version": _pandoc_version()},
+        "epubcheck": Path(JAR).exists(),
+        "features": {"footnotes": True, "rtl_postprocess": True, "docx": True}
+    }
+
 
 @app.post("/v1/jobs")
-async def create_job(file:UploadFile=File(...),platform:str=Form("general"),ticket:str=Form(...)):
-    cleanup();filename=file.filename or ""
-    verify_ticket(ticket,filename,platform)
-    if not filename.lower().endswith(".docx"):raise HTTPException(415,"docx_only")
-    data=await file.read();stats=inspect_docx(data)
-    # Footnotes are supported in v1.1. Tables/images remain outside the automatic MVP.
-    if stats["pages"]>300 or stats["tables"] or stats["images"]:
-        raise HTTPException(422,detail={"status":"team_review","analysis":stats,"reason":"outside_mvp_auto_scope"})
-    jobid=str(uuid.uuid4());token=secrets.token_urlsafe(32);d=BASE/jobid;d.mkdir();out=d/"book.epub"
-    title,chapters,conversion=build_epub(data,out);qa=epubcheck(out)
+async def create_job(file: UploadFile = File(...), platform: str = Form("general"), ticket: str = Form(...)):
+    cleanup(); filename = file.filename or ""
+    verify_ticket(ticket, filename, platform)
+    if not filename.lower().endswith(".docx"):
+        raise HTTPException(415, "docx_only")
+    data = await file.read(); stats = inspect_docx(data)
+    # MVP v2: text-first DOCX + footnotes. Tables/images stay review-only for now.
+    if stats["pages"] > 300 or stats["tables"] or stats["images"]:
+        raise HTTPException(422, detail={"status": "team_review", "analysis": stats, "reason": "outside_mvp_auto_scope"})
+    jobid = str(uuid.uuid4()); token = secrets.token_urlsafe(32); d = BASE / jobid; d.mkdir(); out = d / "book.epub"
+    try:
+        title, chapters, conversion = build_epub(data, out)
+        qa = epubcheck(out)
+    except HTTPException:
+        raise
+    except Exception as e:
+        JOBS[jobid] = {"id": jobid, "created": time.time(), "dir": str(d), "token": token, "status": "failed", "message": "Conversion failed", "error": str(e)[-2000:]}
+        return {"ok": True, "job": {"id": jobid}, "access_token": token}
     if not qa["passed"]:
-        JOBS[jobid]={"id":jobid,"created":time.time(),"dir":str(d),"token":token,"status":"failed","message":"EPUBCheck failed","qa":qa}
+        JOBS[jobid] = {"id": jobid, "created": time.time(), "dir": str(d), "token": token, "status": "failed", "message": "EPUBCheck failed", "qa": qa, "conversion": conversion, "analysis": stats}
     else:
-        JOBS[jobid]={"id":jobid,"created":time.time(),"dir":str(d),"token":token,"status":"completed","message":"تم التحويل","qa":{"passed":True},"epubcheck":qa,"title":title,"chapters":chapters,"conversion":conversion,"analysis":stats,"path":str(out),"name":Path(filename).stem+".epub"}
-    return {"ok":True,"job":{"id":jobid},"access_token":token}
+        JOBS[jobid] = {"id": jobid, "created": time.time(), "dir": str(d), "token": token, "status": "completed", "message": "تم التحويل", "qa": {"passed": True}, "epubcheck": qa, "title": title, "chapters": chapters, "conversion": conversion, "analysis": stats, "path": str(out), "name": Path(filename).stem + ".epub"}
+    return {"ok": True, "job": {"id": jobid}, "access_token": token}
+
 
 @app.get("/v1/jobs/{jobid}")
-def job_status(jobid:str,token:str=Query(...)):
-    j=get_job(jobid,token);return {"ok":True,"job":{"id":j["id"],"status":j["status"],"message":j.get("message","")}}
+def job_status(jobid: str, token: str = Query(...)):
+    j = get_job(jobid, token)
+    payload = {"id": j["id"], "status": j["status"], "message": j.get("message", "")}
+    if j["status"] == "failed":
+        payload["error"] = j.get("error", "")
+        payload["qa"] = j.get("qa", {})
+    return {"ok": True, "job": payload}
+
 
 @app.get("/v1/jobs/{jobid}/preview")
-def preview(jobid:str,token:str=Query(...)):
-    j=get_job(jobid,token)
-    if j["status"]!="completed":raise HTTPException(409,"not_completed")
-    return {"ok":True,"title":j["title"],"chapters":j["chapters"],"qa":j["qa"],"epubcheck":j["epubcheck"],"conversion":j.get("conversion",{}),"analysis":j.get("analysis",{})}
+def preview(jobid: str, token: str = Query(...)):
+    j = get_job(jobid, token)
+    if j["status"] != "completed":
+        raise HTTPException(409, "not_completed")
+    return {"ok": True, "title": j["title"], "chapters": j["chapters"], "qa": j["qa"], "epubcheck": j["epubcheck"], "conversion": j.get("conversion", {}), "analysis": j.get("analysis", {})}
+
 
 @app.get("/v1/jobs/{jobid}/download")
-def download(jobid:str,token:str=Query(...)):
-    j=get_job(jobid,token)
-    if j["status"]!="completed" or not Path(j["path"]).exists():raise HTTPException(404,"missing")
-    return FileResponse(j["path"],media_type="application/epub+zip",filename=j["name"])
+def download(jobid: str, token: str = Query(...)):
+    j = get_job(jobid, token)
+    if j["status"] != "completed" or not Path(j["path"]).exists():
+        raise HTTPException(404, "missing")
+    return FileResponse(j["path"], media_type="application/epub+zip", filename=j["name"])
