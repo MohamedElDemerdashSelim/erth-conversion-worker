@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from docx import Document
 from lxml import etree
 
-app = FastAPI(title="ERTH Conversion Worker", version="2.0.0")
+app = FastAPI(title="ERTH Conversion Worker", version="2.0.1")
 SECRET = os.getenv("ERTH_WORKER_SECRET", "")
 ORIGIN = os.getenv("ERTH_ALLOWED_ORIGIN", "https://erthpub.com")
 TTL = int(os.getenv("ERTH_JOB_TTL", "2700"))
@@ -195,10 +195,10 @@ def _postprocess_epub(raw_epub, out_epub, title):
             continue
 
     erth_css = """
-html,body{direction:rtl;text-align:right}
+html,body{text-align:right}
 body{font-family:serif;line-height:1.9;color:#202733}
 p{text-align:justify;text-justify:inter-word}
-h1,h2,h3,h4,h5,h6{direction:rtl;text-align:right;line-height:1.5}
+h1,h2,h3,h4,h5,h6{text-align:right;line-height:1.5}
 a[epub\\:type='noteref'],a.footnote-ref{text-decoration:none}
 .footnotes{margin-top:2.5em;border-top:1px solid #ccc;padding-top:1em}
 .footnote{line-height:1.75}
@@ -274,7 +274,7 @@ def build_epub(data, out):
     raw = jobdir / "pandoc.epub"
     css = jobdir / "erth.css"
     src.write_bytes(data)
-    css.write_text("html,body{direction:rtl;text-align:right} p{text-align:justify;text-justify:inter-word}", encoding="utf-8")
+    css.write_text("html,body{text-align:right} p{text-align:justify;text-justify:inter-word}", encoding="utf-8")
 
     cmd = [
         PANDOC, str(src), "-o", str(raw), "--to=epub3", "--toc",
@@ -310,7 +310,7 @@ def health():
     return {
         "ok": True,
         "service": "ERTH Conversion Worker",
-        "version": "2.0.0",
+        "version": "2.0.1",
         "engine": {"name": "pandoc", "available": shutil.which(PANDOC) is not None, "version": _pandoc_version()},
         "epubcheck": Path(JAR).exists(),
         "features": {"footnotes": True, "rtl_postprocess": True, "docx": True}
